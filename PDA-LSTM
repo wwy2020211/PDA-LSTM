@@ -1,0 +1,859 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+PDA-LSTM reproduction for:
+"PDA-LSTM: Knowledge-Driven LSTM Data Arrangement Optimization for
+3D NAND Flash Storage with Lateral Charge Migration Suppression"
+
+Core implementation:
+1) X [B, N, D] -> LSTM -> Linear -> Softmax -> P_lc [B, N, N]
+2) Exclusive cumulative product -> non-repeated sequence probability P_sg
+3) torch.einsum -> adjacent triple probability cube P_AC [B, N, N, N]
+4) Physics LCM score LUT + chunked GPU broadcasting -> S_AC [B, N, N, N]
+5) torch.einsum(P_AC, S_AC) -> expected physical score
+6) Loss = - expected score
+
+Notes:
+- Paper-specified:
+    N=16
+    D=18*1024*8 physical cells/page
+    QLC state in {0,...,15}
+    LSTM hidden_size=32
+    one Linear layer
+    no LayerNorm
+    H0=zeros, C0=ones
+    k1:k2 = 4:1
+    train:test = 7:3
+- Paper does NOT specify:
+    optimizer, learning rate, batch size, number of samples, alpha.
+  Defaults below are engineering defaults and can be changed by CLI.
+- Eq.(7) as printed is ambiguous/inconsistent with Fig.6.
+  This implementation follows Fig.6 and the "three adjacent wordlines"
+  description: positions t, t+1, t+2.
+"""
+
+import argparse
+import math
+import random
+from dataclasses import dataclass, asdict
+from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+
+@dataclass
+class Config:
+    n_pages: int = 16
+    page_cells: int = 18 * 1024 * 8     # 147456
+    hidden_size: int = 32
+    linear_layers: int = 1             # paper's selected model
+    num_samples: int = 128             # paper does not specify sample count
+    train_ratio: float = 0.7
+    batch_size: int = 1                # safe default for RTX 4090 24GB
+    epochs: int = 500                  # figures show training up to ~500 iterations/epochs
+    lr: float = 1e-4                   # paper does not specify
+    weight_decay: float = 0.0
+    alpha: float = 1.0                 # paper says alpha scales score but gives no value
+    k1: float = 4.0
+    k2: float = 1.0
+    score_chunk: int = 1024
+    seed: int = 2025
+    num_workers: int = 0
+    checkpoint: str = "pda_lstm.pt"
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# -----------------------------
+# Dataset
+# -----------------------------
+
+class RandomQLCDataset(Dataset):
+    """
+    Each sample:
+        X: [N, D], uint8, values 0..15
+
+    The paper states random data in 0..15 and train:test=7:3,
+    but does not state the total number of samples.
+    Samples are generated deterministically from index.
+    """
+
+    def __init__(self, num_samples: int, n_pages: int, page_cells: int, seed: int):
+        self.num_samples = num_samples
+        self.n_pages = n_pages
+        self.page_cells = page_cells
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int):
+        g = torch.Generator()
+        g.manual_seed(self.seed + int(idx))
+
+        x = torch.randint(
+            low=0,
+            high=16,
+            size=(self.n_pages, self.page_cells),
+            dtype=torch.uint8,
+            generator=g,
+        )
+
+        # Return global sample index for score caching.
+        return torch.tensor(idx, dtype=torch.long), x
+
+
+# -----------------------------
+# Physics score
+# -----------------------------
+
+def build_score_lut(
+    device: torch.device,
+    alpha: float = 1.0,
+    k1: float = 4.0,
+    k2: float = 1.0,
+) -> torch.Tensor:
+    """
+    LUT[u,v,w] = s(u,v,w), shape [16,16,16].
+
+    s(x_{n-1}, x_n, x_{n+1})
+      = Ae * (16-x_n) *
+        [ k2*(16-|x_{n-1}-x_n|)
+        + k1*(16-|x_n-x_{n+1}|) ] / [alpha*(k1+k2)]
+
+    Ae from Table I:
+      center E(0)                 -> 5
+      center P, both neigh E      -> 1
+      center P, exactly one E     -> 2
+      center P, both neigh P      -> 5
+    """
+    if alpha <= 0:
+        raise ValueError("alpha must be > 0")
+
+    s = torch.arange(16, device=device, dtype=torch.float32)
+
+    xa = s[:, None, None]       # [16,1,1]
+    xb = s[None, :, None]       # [1,16,1]
+    xc = s[None, None, :]       # [1,1,16]
+
+    center_e = (xb == 0)
+    left_e = (xa == 0)
+    right_e = (xc == 0)
+
+    ae = torch.where(
+        center_e,
+        torch.full_like(xb + xa + xc, 5.0),
+        torch.where(
+            left_e & right_e,
+            torch.full_like(xb + xa + xc, 1.0),
+            torch.where(
+                left_e ^ right_e,
+                torch.full_like(xb + xa + xc, 2.0),
+                torch.full_like(xb + xa + xc, 5.0),
+            ),
+        ),
+    )
+
+    f = (
+        k2 * (16.0 - torch.abs(xa - xb))
+        + k1 * (16.0 - torch.abs(xb - xc))
+    ) / (alpha * (k1 + k2))
+
+    lut = ae * (16.0 - xb) * f
+    return lut.contiguous()
+
+
+def build_valid_triple_mask(n_pages: int, device: torch.device) -> torch.Tensor:
+    """
+    mask[i,j,k] = True iff i,j,k are all different.
+    Shape [N,N,N].
+    """
+    ids = torch.arange(n_pages, device=device)
+    i = ids[:, None, None]
+    j = ids[None, :, None]
+    k = ids[None, None, :]
+    return (i != j) & (i != k) & (j != k)
+
+
+@torch.no_grad()
+def build_score_cube(
+    x: torch.Tensor,
+    score_lut: torch.Tensor,
+    valid_mask: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """
+    Compute S_AC for all ordered page triples in parallel.
+
+    Input:
+        x: [B,N,D], uint8/int, values 0..15
+
+    Output:
+        S_AC: [B,N,N,N], float32
+
+    Important:
+        We NEVER materialize [B,N,N,N,D].
+        Only [B,N,N,N,C] for a small cell chunk C is materialized.
+
+    This is intentionally LUT+GPU broadcasting rather than one-hot einsum:
+    the physics score contains abs() and discrete Ae conditions, so LUT gather
+    is much more memory-efficient than expanding every cell to 16-way one-hot.
+
+    Einstein summation is used later for the actual probability tensor
+    contractions, where it is the correct primitive.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"x must be [B,N,D], got {tuple(x.shape)}")
+
+    B, N, D = x.shape
+    if valid_mask.shape != (N, N, N):
+        raise ValueError("valid_mask shape mismatch")
+
+    out = torch.zeros(
+        (B, N, N, N),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    lut_flat = score_lut.reshape(-1)  # 16^3 = 4096
+
+    for d0 in range(0, D, chunk_size):
+        d1 = min(d0 + chunk_size, D)
+
+        # [B,N,C]
+        z = x[:, :, d0:d1].long()
+
+        # Broadcast views:
+        # xa [B,N,1,1,C]
+        # xb [B,1,N,1,C]
+        # xc [B,1,1,N,C]
+        xa = z[:, :, None, None, :]
+        xb = z[:, None, :, None, :]
+        xc = z[:, None, None, :, :]
+
+        # Flatten (state_a, state_b, state_c) -> 0..4095
+        # Materializes only the chunked 5D index tensor.
+        idx = xa * 256 + xb * 16 + xc
+
+        # LUT lookup for all N^3 triples and all C cells in parallel.
+        local = lut_flat[idx]  # [B,N,N,N,C]
+
+        # Sum over physical-cell dimension.
+        out.add_(local.sum(dim=-1))
+
+    # Eq.(8): invalid repeated-page triples have zero score.
+    out.mul_(valid_mask[None].to(out.dtype))
+    return out
+
+
+# -----------------------------
+# PDA-LSTM model
+# -----------------------------
+
+class PDALSTM(nn.Module):
+    """
+    Paper model:
+        [B,N,D]
+          -> LSTM(hidden=32)
+          -> Linear
+          -> Softmax
+          -> P_lc [B,N,N]
+
+    Convention:
+        P_lc[b,i,j] = probability that page i is assigned to position j.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        n_pages: int = 16,
+        hidden_size: int = 32,
+        linear_layers: int = 1,
+    ):
+        super().__init__()
+
+        if linear_layers < 1:
+            raise ValueError("linear_layers must be >= 1")
+
+        self.input_dim = input_dim
+        self.n_pages = n_pages
+        self.hidden_size = hidden_size
+        self.linear_layers = linear_layers
+
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # Paper's selected structure uses one linear layer.
+        if linear_layers == 1:
+            self.head = nn.Linear(hidden_size, n_pages)
+        else:
+            layers = []
+            in_dim = hidden_size
+            for _ in range(linear_layers - 1):
+                layers.append(nn.Linear(in_dim, hidden_size))
+                layers.append(nn.ReLU())
+                in_dim = hidden_size
+            layers.append(nn.Linear(in_dim, n_pages))
+            self.head = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: float tensor [B,N,D]
+        return P_lc [B,N,N]
+        """
+        B = x.shape[0]
+
+        # Fig.6: H0=zeros, C0=ones.
+        h0 = torch.zeros(
+            1, B, self.hidden_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        c0 = torch.ones(
+            1, B, self.hidden_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        # No LayerNorm, following paper.
+        h, _ = self.lstm(x, (h0, c0))    # [B,N,H]
+        logits = self.head(h)             # [B,N,N]
+        p_lc = torch.softmax(logits, dim=-1)
+        return p_lc
+
+
+# -----------------------------
+# Probability tensor pipeline
+# -----------------------------
+
+def sequence_generation_probability(p_lc: torch.Tensor) -> torch.Tensor:
+    """
+    Eq.(6)-style non-repeated sequence probability.
+
+    Convention:
+        p_lc[b,i,j] = P(page i -> position j)
+
+    Suppress reuse of the same position j by later pages:
+        P_sg[i,j] = P_lc[i,j] * prod_{t<i}(1 - P_lc[t,j])
+
+    All positions/pages are processed in parallel by torch.cumprod.
+    No permutation enumeration.
+    """
+    if p_lc.ndim != 3:
+        raise ValueError("p_lc must be [B,N,N]")
+
+    # Exclusive prefix product along page-generation axis i.
+    prefix = torch.cat(
+        [
+            torch.ones_like(p_lc[:, :1, :]),
+            torch.cumprod(1.0 - p_lc[:, :-1, :], dim=1),
+        ],
+        dim=1,
+    )
+
+    return p_lc * prefix
+
+
+def adjacent_combination_probability(p_sg: torch.Tensor) -> torch.Tensor:
+    """
+    Fig.6-consistent adjacent triple probability.
+
+    p_sg: [B, page, position]
+
+    P_AC[i,j,k]
+      = sum_t P_sg[i,t] * P_sg[j,t+1] * P_sg[k,t+2]
+
+    Einstein summation:
+        A: [B, page_i, t]
+        B: [B, page_j, t]
+        C: [B, page_k, t]
+        -> [B, page_i, page_j, page_k]
+
+    No N! enumeration.
+    """
+    if p_sg.ndim != 3:
+        raise ValueError("p_sg must be [B,N,N]")
+
+    if p_sg.shape[-1] < 3:
+        raise ValueError("Need at least 3 positions")
+
+    left = p_sg[:, :, :-2]      # [B,N,T]
+    middle = p_sg[:, :, 1:-1]   # [B,N,T]
+    right = p_sg[:, :, 2:]      # [B,N,T]
+
+    # Core Einstein contraction.
+    p_ac = torch.einsum(
+        "bit,bjt,bkt->bijk",
+        left,
+        middle,
+        right,
+    )
+    return p_ac
+
+
+def pda_physics_loss(
+    p_lc: torch.Tensor,
+    s_ac: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Full differentiable physics-driven training objective.
+
+    Returns:
+        loss
+        expected_score [B]
+        p_sg [B,N,N]
+        p_ac [B,N,N,N]
+    """
+    p_sg = sequence_generation_probability(p_lc)
+    p_ac = adjacent_combination_probability(p_sg)
+
+    # Einstein inner product over the three page axes.
+    expected_score = torch.einsum(
+        "bijk,bijk->b",
+        p_ac,
+        s_ac,
+    )
+
+    # Eq.(10): maximize score <=> minimize negative score.
+    loss = -expected_score.mean()
+    return loss, expected_score, p_sg, p_ac
+
+
+# -----------------------------
+# Score cache
+# -----------------------------
+
+@torch.no_grad()
+def get_score_batch(
+    indices: torch.Tensor,
+    x_gpu: torch.Tensor,
+    cache: Dict[int, torch.Tensor],
+    score_lut: torch.Tensor,
+    valid_mask: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """
+    Cache S_AC on CPU after first calculation.
+    This avoids recomputing the expensive physics score every epoch.
+
+    Each cached sample is only N^3 float32 values:
+        16^3 * 4 bytes = 16 KB/sample.
+    """
+    idx_list = [int(v) for v in indices.tolist()]
+    missing_pos = [p for p, idx in enumerate(idx_list) if idx not in cache]
+
+    if missing_pos:
+        missing_x = x_gpu[missing_pos]
+        missing_s = build_score_cube(
+            missing_x,
+            score_lut=score_lut,
+            valid_mask=valid_mask,
+            chunk_size=chunk_size,
+        )
+
+        for local_pos, batch_pos in enumerate(missing_pos):
+            idx = idx_list[batch_pos]
+            cache[idx] = missing_s[local_pos].detach().cpu()
+
+    s = torch.stack([cache[idx] for idx in idx_list], dim=0)
+    return s.to(x_gpu.device, non_blocking=True)
+
+
+# -----------------------------
+# Decode / evaluation
+# -----------------------------
+
+@torch.no_grad()
+def decode_argmax(p_lc: torch.Tensor) -> torch.Tensor:
+    """
+    Paper-style inference:
+        choose the largest-probability position for each page.
+
+    Returns:
+        page_to_position [B,N]
+    """
+    return torch.argmax(p_lc, dim=-1)
+
+
+@torch.no_grad()
+def decode_hungarian(p_lc: torch.Tensor) -> torch.Tensor:
+    """
+    Optional guaranteed one-to-one decoding.
+    This does NOT enumerate permutations; it uses linear assignment.
+
+    Requires scipy.
+    Returns:
+        page_to_position [B,N]
+    """
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError as e:
+        raise ImportError(
+            "scipy is required for Hungarian decoding: pip install scipy"
+        ) from e
+
+    outputs = []
+    for b in range(p_lc.shape[0]):
+        # Maximize probability <=> minimize negative probability.
+        cost = (-p_lc[b]).detach().cpu().numpy()
+        rows, cols = linear_sum_assignment(cost)
+
+        out = torch.empty(
+            p_lc.shape[1],
+            dtype=torch.long,
+            device=p_lc.device,
+        )
+        out[torch.as_tensor(rows, device=p_lc.device)] = torch.as_tensor(
+            cols, device=p_lc.device
+        )
+        outputs.append(out)
+
+    return torch.stack(outputs, dim=0)
+
+
+@torch.no_grad()
+def realized_arrangement_score(
+    page_to_position: torch.Tensor,
+    s_ac: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Score the decoded one-to-one arrangement.
+
+    page_to_position[b,page] = position
+
+    Convert to:
+        position_to_page = argsort(page_to_position)
+
+    Then sum S_AC over adjacent physical positions:
+        (t,t+1,t+2)
+    """
+    position_to_page = torch.argsort(page_to_position, dim=1)
+
+    a = position_to_page[:, :-2]
+    b = position_to_page[:, 1:-1]
+    c = position_to_page[:, 2:]
+
+    batch = torch.arange(
+        s_ac.shape[0],
+        device=s_ac.device,
+    )[:, None]
+
+    triple_scores = s_ac[batch, a, b, c]
+    return triple_scores.sum(dim=1)
+
+
+# -----------------------------
+# Train / test
+# -----------------------------
+
+def make_loaders(cfg: Config):
+    dataset = RandomQLCDataset(
+        num_samples=cfg.num_samples,
+        n_pages=cfg.n_pages,
+        page_cells=cfg.page_cells,
+        seed=cfg.seed,
+    )
+
+    n_train = int(round(len(dataset) * cfg.train_ratio))
+    n_train = min(max(n_train, 1), len(dataset) - 1)
+    n_test = len(dataset) - n_train
+
+    train_set, test_set = random_split(
+        dataset,
+        [n_train, n_test],
+        generator=torch.Generator().manual_seed(cfg.seed),
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_set,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+    return train_loader, test_loader
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def train(cfg: Config, device: torch.device):
+    train_loader, test_loader = make_loaders(cfg)
+
+    model = PDALSTM(
+        input_dim=cfg.page_cells,
+        n_pages=cfg.n_pages,
+        hidden_size=cfg.hidden_size,
+        linear_layers=cfg.linear_layers,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+
+    score_lut = build_score_lut(
+        device=device,
+        alpha=cfg.alpha,
+        k1=cfg.k1,
+        k2=cfg.k2,
+    )
+
+    valid_mask = build_valid_triple_mask(
+        n_pages=cfg.n_pages,
+        device=device,
+    )
+
+    # CPU cache of physics score cubes.
+    score_cache: Dict[int, torch.Tensor] = {}
+
+    print("device:", device)
+    print("model parameters:", f"{count_parameters(model):,}")
+    print("train samples:", len(train_loader.dataset))
+    print("test samples:", len(test_loader.dataset))
+    print("score cache: enabled")
+    print(
+        "NOTE: optimizer/lr/batch_size/num_samples/alpha are not specified "
+        "by the paper and are configurable."
+    )
+
+    best_test_loss = math.inf
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+
+        train_loss_sum = 0.0
+        train_score_sum = 0.0
+        train_count = 0
+
+        for indices, x_cpu in train_loader:
+            indices = indices.long()
+
+            # Keep original data uint8 for physics LUT.
+            x_u8 = x_cpu.to(
+                device,
+                non_blocking=True,
+            )
+
+            # Physics scores have no gradient and are cached.
+            s_ac = get_score_batch(
+                indices=indices,
+                x_gpu=x_u8,
+                cache=score_cache,
+                score_lut=score_lut,
+                valid_mask=valid_mask,
+                chunk_size=cfg.score_chunk,
+            )
+
+            # LSTM requires floating-point input.
+            # No LayerNorm / normalization, following paper.
+            x = x_u8.float()
+
+            p_lc = model(x)
+            loss, expected_score, _, _ = pda_physics_loss(
+                p_lc=p_lc,
+                s_ac=s_ac,
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            bs = x.shape[0]
+            train_loss_sum += float(loss.detach()) * bs
+            train_score_sum += float(expected_score.detach().sum())
+            train_count += bs
+
+        train_loss = train_loss_sum / train_count
+        train_score = train_score_sum / train_count
+
+        # -------------------------
+        # Evaluation
+        # -------------------------
+        model.eval()
+
+        test_loss_sum = 0.0
+        test_score_sum = 0.0
+        realized_score_sum = 0.0
+        test_count = 0
+
+        with torch.no_grad():
+            for indices, x_cpu in test_loader:
+                indices = indices.long()
+
+                x_u8 = x_cpu.to(
+                    device,
+                    non_blocking=True,
+                )
+
+                s_ac = get_score_batch(
+                    indices=indices,
+                    x_gpu=x_u8,
+                    cache=score_cache,
+                    score_lut=score_lut,
+                    valid_mask=valid_mask,
+                    chunk_size=cfg.score_chunk,
+                )
+
+                x = x_u8.float()
+                p_lc = model(x)
+
+                loss, expected_score, _, _ = pda_physics_loss(
+                    p_lc=p_lc,
+                    s_ac=s_ac,
+                )
+
+                # Paper-style row argmax.
+                page_to_position = decode_argmax(p_lc)
+
+                # This realized score is meaningful when decoded mapping
+                # is effectively one-to-one after training.
+                realized_score = realized_arrangement_score(
+                    page_to_position=page_to_position,
+                    s_ac=s_ac,
+                )
+
+                bs = x.shape[0]
+                test_loss_sum += float(loss) * bs
+                test_score_sum += float(expected_score.sum())
+                realized_score_sum += float(realized_score.sum())
+                test_count += bs
+
+        test_loss = test_loss_sum / test_count
+        test_score = test_score_sum / test_count
+        realized_score = realized_score_sum / test_count
+
+        if epoch == 1 or epoch % 10 == 0 or epoch == cfg.epochs:
+            print(
+                f"epoch={epoch:04d} "
+                f"train_loss={train_loss:.6e} "
+                f"train_Escore={train_score:.6e} "
+                f"test_loss={test_loss:.6e} "
+                f"test_Escore={test_score:.6e} "
+                f"decoded_score={realized_score:.6e} "
+                f"cached={len(score_cache)}"
+            )
+
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "config": asdict(cfg),
+                    "best_test_loss": best_test_loss,
+                },
+                cfg.checkpoint,
+            )
+
+    print("saved:", cfg.checkpoint)
+    return model, score_cache, test_loader, score_lut, valid_mask
+
+
+# -----------------------------
+# Inference example
+# -----------------------------
+
+@torch.no_grad()
+def inference_example(
+    model: PDALSTM,
+    loader: DataLoader,
+    device: torch.device,
+):
+    model.eval()
+
+    _, x_cpu = next(iter(loader))
+    x = x_cpu.to(device).float()
+
+    p_lc = model(x)
+
+    argmax_assignment = decode_argmax(p_lc)
+
+    print("\nP_lc shape:", tuple(p_lc.shape))
+    print("Argmax page->position:")
+    print(argmax_assignment[0].detach().cpu().tolist())
+
+    # Optional exact one-to-one assignment without permutation enumeration.
+    try:
+        hungarian_assignment = decode_hungarian(p_lc)
+        print("Hungarian page->position:")
+        print(hungarian_assignment[0].detach().cpu().tolist())
+    except ImportError:
+        pass
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--num-samples", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=500)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--alpha", type=float, default=1.0)
+    p.add_argument("--score-chunk", type=int, default=1024)
+    p.add_argument("--seed", type=int, default=2025)
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--checkpoint", type=str, default="pda_lstm.pt")
+
+    args = p.parse_args()
+
+    return Config(
+        num_samples=args.num_samples,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        alpha=args.alpha,
+        score_chunk=args.score_chunk,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        checkpoint=args.checkpoint,
+    )
+
+
+def main():
+    cfg = parse_args()
+    set_seed(cfg.seed)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        torch.backends.cudnn.benchmark = True
+    else:
+        device = torch.device("cpu")
+
+    model, _, test_loader, _, _ = train(cfg, device)
+    inference_example(model, test_loader, device)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,6 @@
-# PDA-LSTM comparison baseline code
+# PDA-LSTM & baseline code
 
-This directory contains one runnable Python implementation for each comparison
-family used/discussed in the PDA-LSTM paper, with random QLC input.
+PDA-LSTM: Knowledge-driven page data arrangement based on LSTM for LCM supression in QLC 3D NAND flash memories
 
 ## Files
 
